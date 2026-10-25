@@ -15,6 +15,12 @@ struct Uniforms {
   float2 cell_size;
   ushort2 grid_size;
   float4 grid_padding;
+  // Smooth scrolling: .x = sub-row viewport offset in pixels (positive:
+  // content shifted down), .y = grid rows above the viewport, .z = the
+  // height the viewport's rows don't account for, which the shifted grid
+  // may draw into (it is surface, not padding). Grid row y is drawn at
+  // (y - .y) * cell_size.y + .x.
+  float4 scroll_offset;
   uint8_t padding_extend;
   float min_contrast;
   ushort2 cursor_pos;
@@ -24,7 +30,29 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
+  // Region scroll animation. region_rect[i] is an animating rectangle in
+  // grid pixels (left, top, right, bottom); region_shift[i].x is how far
+  // its content is currently drawn from its final place (positive: down).
+  // Grid row grid_size.y + k is a ghost row that scrolled out of region
+  // ghost_rows[k].x and is drawn at row ghost_rows[k].y, outside the
+  // region, clipped to it. anim_counts.x regions and .y ghosts are live.
+  float4 region_rect[4];
+  float4 region_shift[4];
+  int4 ghost_rows[64];
+  uint4 anim_counts;
 };
+
+// The region scroll animation a grid cell takes part in, or -1. `pos` is
+// the cell's top-left in grid pixels, before any shift.
+int region_of(constant Uniforms& uniforms, float2 pos) {
+  for (uint i = 0; i < uniforms.anim_counts.x; i++) {
+    float4 r = uniforms.region_rect[i];
+    if (pos.x >= r.x && pos.x < r.z && pos.y >= r.y && pos.y < r.w) {
+      return int(i);
+    }
+  }
+  return -1;
+}
 
 //-------------------------------------------------------------------
 // Color Functions
@@ -453,39 +481,90 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // Position relative to the visible grid. Its extent comes from the
+  // grid itself, not from grid_padding's bottom/right, which hold the
+  // leftover measured at the last resize and can be stale. While smooth
+  // scrolling the grid carries one row more than is visible. Padding
+  // decisions use this unshifted position; the cell lookup below then
+  // applies the shift, so a partially revealed row never leaks into
+  // the padding.
+  float2 rel = in.position.xy - uniforms.grid_padding.wx;
+  float extra_rows = uniforms.scroll_offset.x != 0.0
+      ? max(uniforms.scroll_offset.y, 1.0)
+      : 0.0;
+  float2 visible = uniforms.cell_size *
+      float2(uniforms.grid_size.x, float(uniforms.grid_size.y) - extra_rows);
+  // A shifted grid sits on the height its rows don't account for, so that
+  // strip is grid, not padding.
+  visible.y += uniforms.scroll_offset.x != 0.0 ? uniforms.scroll_offset.z : 0.0;
 
   float4 bg = float4(0.0);
 
   // Clamp x position, extends edge bg colors in to padding on sides.
-  if (grid_pos.x < 0) {
+  if (rel.x < 0.0) {
     if (uniforms.padding_extend & EXTEND_LEFT) {
-      grid_pos.x = 0;
+      rel.x = 0.0;
     } else {
       return bg;
     }
-  } else if (grid_pos.x > uniforms.grid_size.x - 1) {
+  } else if (rel.x >= visible.x) {
     if (uniforms.padding_extend & EXTEND_RIGHT) {
-      grid_pos.x = uniforms.grid_size.x - 1;
+      rel.x = visible.x - 0.5;
     } else {
       return bg;
     }
   }
 
   // Clamp y position if we should extend, otherwise discard if out of bounds.
-  if (grid_pos.y < 0) {
+  if (rel.y < 0.0) {
     if (uniforms.padding_extend & EXTEND_UP) {
-      grid_pos.y = 0;
+      rel.y = 0.0;
     } else {
       return bg;
     }
-  } else if (grid_pos.y > uniforms.grid_size.y - 1) {
+  } else if (rel.y >= visible.y) {
     if (uniforms.padding_extend & EXTEND_DOWN) {
-      grid_pos.y = uniforms.grid_size.y - 1;
+      rel.y = visible.y - 0.5;
     } else {
       return bg;
     }
   }
+
+  float shift_y = uniforms.scroll_offset.x -
+      uniforms.scroll_offset.y * uniforms.cell_size.y;
+  float2 grid_px = rel - float2(0.0, shift_y);
+
+  // Region scroll animation: inside an animating rectangle the content
+  // is drawn shifted, so look the cell up where it is drawn from. Past
+  // the region's own rows that is a ghost row sliding out, if one is
+  // still there, and otherwise nothing: the surface background.
+  int region = region_of(uniforms, grid_px);
+  if (region >= 0) {
+    float4 r = uniforms.region_rect[region];
+    float y = grid_px.y - uniforms.region_shift[region].x;
+    int row = int(floor(y / uniforms.cell_size.y));
+    int col = clamp(int(floor(grid_px.x / uniforms.cell_size.x)),
+                    0, int(uniforms.grid_size.x) - 1);
+    int cols = int(uniforms.grid_size.x);
+    if (y >= r.y && y < r.w) {
+      row = clamp(row, 0, int(uniforms.grid_size.y) - 1);
+      return load_color(cells[row * cols + col],
+                        uniforms.use_display_p3,
+                        uniforms.use_linear_blending);
+    }
+    for (uint k = 0; k < uniforms.anim_counts.y; k++) {
+      int4 ghost = uniforms.ghost_rows[k];
+      if (ghost.x == region && ghost.y == row) {
+        return load_color(cells[(int(uniforms.grid_size.y) + int(k)) * cols + col],
+                          uniforms.use_display_p3,
+                          uniforms.use_linear_blending);
+      }
+    }
+    return bg;
+  }
+
+  int2 grid_pos = int2(floor(grid_px / uniforms.cell_size));
+  grid_pos = clamp(grid_pos, int2(0), int2(uniforms.grid_size) - 1);
 
   // Load the color for the cell.
   uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
@@ -551,6 +630,9 @@ struct CellTextVertexOut {
   float4 color [[flat]];
   float4 bg_color [[flat]];
   float2 tex_coord;
+  // Grid-pixel rectangle the glyph is clipped to: the region it is
+  // scrolling in, or everything.
+  float4 clip [[flat]];
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -561,6 +643,28 @@ vertex CellTextVertexOut cell_text_vertex(
 ) {
   // Convert the grid x, y into world space x, y by accounting for cell size
   float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
+
+  // Region scroll animation: a ghost row (beyond the grid) is drawn at
+  // the row it scrolled to, and every cell of an animating region is
+  // shifted by the region's remaining distance and clipped to it.
+  float4 clip = float4(-1.0e9, -1.0e9, 1.0e9, 1.0e9);
+  int region = -1;
+  if (in.grid_pos.y >= uniforms.grid_size.y) {
+    int4 ghost = uniforms.ghost_rows[in.grid_pos.y - uniforms.grid_size.y];
+    region = ghost.x;
+    cell_pos.y = uniforms.cell_size.y * float(ghost.y);
+  } else {
+    region = region_of(uniforms, cell_pos);
+  }
+  if (region >= 0) {
+    cell_pos.y += uniforms.region_shift[region].x;
+    clip = uniforms.region_rect[region];
+  }
+
+  // Smooth scrolling: grid rows are shifted by the sub-row offset, with
+  // an extra row above the viewport drawn at negative y.
+  cell_pos.y += uniforms.scroll_offset.x -
+      uniforms.scroll_offset.y * uniforms.cell_size.y;
 
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in
@@ -582,6 +686,7 @@ vertex CellTextVertexOut cell_text_vertex(
 
   CellTextVertexOut out;
   out.atlas = in.atlas;
+  out.clip = clip;
 
   //              === Grid Cell ===
   //      +X
@@ -686,6 +791,28 @@ fragment float4 cell_text_fragment(
     address::clamp_to_edge,
     filter::nearest
   );
+
+  // Region scroll animation: a glyph sliding in or out of its region
+  // stops at the region's edge.
+  {
+    float2 rel = in.position.xy - uniforms.grid_padding.wx;
+    if (rel.x < in.clip.x || rel.x >= in.clip.z ||
+        rel.y < in.clip.y || rel.y >= in.clip.w) {
+      discard_fragment();
+    }
+  }
+
+  // Smooth scrolling: a partially revealed row extends into the padding;
+  // clip it to the visible grid. Only while shifted, so glyphs that
+  // legitimately overhang a cell edge are untouched at rest.
+  if (uniforms.scroll_offset.x != 0.0) {
+    float y = in.position.y - uniforms.grid_padding.x;
+    float extra_rows = max(uniforms.scroll_offset.y, 1.0);
+    float visible_h =
+        (float(uniforms.grid_size.y) - extra_rows) * uniforms.cell_size.y +
+        uniforms.scroll_offset.z;
+    if (y < 0.0 || y >= visible_h) discard_fragment();
+  }
 
   switch (in.atlas) {
     default:
@@ -822,6 +949,10 @@ vertex ImageVertexOut image_vertex(
   // adds the source rect width/height components.
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
+
+  // Smooth scrolling: image placements are in terminal viewport rows,
+  // so they move by the sub-row offset alone.
+  image_pos.y += uniforms.scroll_offset.x;
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);

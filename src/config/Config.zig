@@ -999,6 +999,26 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Draw the viewport between rows while scrolling with a precision device
+/// (trackpad, Magic Mouse), so scrollback moves by pixels rather than jumping
+/// a row at a time. Precision scrolling is already accumulated in pixels;
+/// this keeps the sub-row remainder and renders it, which is what makes
+/// the motion continuous, momentum included.
+///
+/// The scrollback viewport scrolls this way. A program on the alternate
+/// screen (an editor, a pager) that scrolls a region of its screen by rows
+/// with the terminal's scroll margins (DECSTBM/DECSLRM with SU/SD, or an
+/// index at the margin) is animated too: the region's new content slides in
+/// from where the old content was, and the rows that scrolled out slide
+/// away with it. A program that repaints every cell instead gets no motion,
+/// and mouse reporting still turns the wheel into button events. Discrete
+/// wheels always scroll the viewport by whole rows.
+///
+/// Ghostty Glide enables this by default on macOS. Other platforms retain
+/// Ghostty's original row-based scrolling unless explicitly enabled.
+/// This can be changed at runtime.
+@"smooth-scroll": bool = builtin.target.os.tag == .macos,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.

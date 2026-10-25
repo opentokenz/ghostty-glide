@@ -17,13 +17,41 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec2 cell_size;
     uniform uint grid_size_packed_2u16;
     uniform vec4 grid_padding;
+    // Smooth scrolling: .x = sub-row viewport offset in pixels (positive:
+    // content shifted down), .y = grid rows above the viewport, .z = the
+    // height the viewport's rows don't account for, which the shifted grid
+    // may draw into (it is surface, not padding). Grid row y is drawn at
+    // (y - .y) * cell_size.y + .x.
+    uniform vec4 scroll_offset;
     uniform uint padding_extend;
     uniform float min_contrast;
     uniform uint cursor_pos_packed_2u16;
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
+    // Region scroll animation; see the Metal Uniforms for the meaning.
+    // region_rect[i]: animating rectangle in grid pixels (left, top,
+    // right, bottom); region_shift[i].x: how far its content is drawn
+    // from its final place (positive: down). Grid row grid_size.y + k is
+    // a ghost row from region ghost_rows[k].x drawn at row ghost_rows[k].y.
+    // anim_counts.x regions and .y ghost rows are live.
+    uniform vec4 region_rect[4];
+    uniform vec4 region_shift[4];
+    uniform ivec4 ghost_rows[64];
+    uniform uvec4 anim_counts;
 };
+
+// The region scroll animation a grid cell takes part in, or -1. `pos` is
+// the cell's top-left in grid pixels, before any shift.
+int region_of(vec2 pos) {
+    for (uint i = 0u; i < anim_counts.x; i++) {
+        vec4 r = region_rect[i];
+        if (pos.x >= r.x && pos.x < r.z && pos.y >= r.y && pos.y < r.w) {
+            return int(i);
+        }
+    }
+    return -1;
+}
 
 // Bools
 const uint CURSOR_WIDE = 1u;
