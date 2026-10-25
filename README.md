@@ -25,9 +25,9 @@
 
 This repository is an unofficial, minimal fork of [Ghostty](https://github.com/ghostty-org/ghostty) focused on smoother terminal scrolling. It keeps Ghostty's native macOS interface, tabs, windows, and splits. It does **not** include MacTerm's sidebar or project-management UI.
 
-- **Pixel-precise scrollback:** Trackpad scrolling renders between rows and preserves macOS momentum events without adding a separate inertia algorithm.
+- **MacTerm-style scrollback:** On macOS, `smooth-scroll = true` and `smooth-scroll-rows = true` animate whole-row moves into place using the same bounded decay as TUI scroll regions. Set `smooth-scroll-rows = false` to use pixel-precise trackpad-following scrollback instead; neither mode adds simulated momentum.
 - **TUI scroll-region animation:** Alternate-screen applications using supported terminal scroll operations (such as SU/SD and margin-triggered index operations) can animate their scrolling regions. Applications that repaint their content directly cannot be made smooth by this feature alone.
-- **Simple configuration:** `smooth-scroll = true` by default on macOS; use `smooth-scroll = false` to restore the original row-based rendering. Other platforms default to off.
+- **Simple configuration:** `smooth-scroll = true` enables both scrolling features; `smooth-scroll-rows` selects the scrollback mode. Both default to true on macOS and false elsewhere. Set `smooth-scroll = false` to restore original Ghostty behavior.
 
 The smooth-scroll implementation is adapted from the [MacTerm Ghostty downstream patch](https://github.com/thdxg/ghostty/blob/64461d0e2778a7d5a0ea85f04bd8ccfa26e1a1d9/.github/downstream/0005-smooth-scroll.patch). Thanks to MacTerm and Ghostty's maintainers. For visual regression testing of alternate-screen scrolling, run `bash test/glide-smooth-scroll.sh` inside Ghostty Glide. See the [V1 implementation plan](docs/plans/2026-10-25-ghostty-glide-v1-smooth-scroll.md) for scope and verification. Ghostty Glide is not an official Ghostty release; the links below describe the upstream project.
 
