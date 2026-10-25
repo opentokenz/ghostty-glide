@@ -490,7 +490,7 @@ fragment float4 cell_bg_fragment(
   // the padding.
   float2 rel = in.position.xy - uniforms.grid_padding.wx;
   float extra_rows = uniforms.scroll_offset.x != 0.0
-      ? max(uniforms.scroll_offset.y, 1.0)
+      ? max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0)
       : 0.0;
   float2 visible = uniforms.cell_size *
       float2(uniforms.grid_size.x, float(uniforms.grid_size.y) - extra_rows);
@@ -807,7 +807,7 @@ fragment float4 cell_text_fragment(
   // legitimately overhang a cell edge are untouched at rest.
   if (uniforms.scroll_offset.x != 0.0) {
     float y = in.position.y - uniforms.grid_padding.x;
-    float extra_rows = max(uniforms.scroll_offset.y, 1.0);
+    float extra_rows = max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0);
     float visible_h =
         (float(uniforms.grid_size.y) - extra_rows) * uniforms.cell_size.y +
         uniforms.scroll_offset.z;

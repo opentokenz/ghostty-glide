@@ -38,7 +38,7 @@ void main() {
     if (scroll_offset.x != 0.0) {
         float y = gl_FragCoord.y - grid_padding.x;
         uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-        float extra_rows = max(scroll_offset.y, 1.0);
+        float extra_rows = max(scroll_offset.y + scroll_offset.w, 1.0);
         float visible_h =
             (float(grid_size.y) - extra_rows) * cell_size.y + scroll_offset.z;
         if (y < 0.0 || y >= visible_h) discard;

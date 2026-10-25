@@ -223,7 +223,9 @@ pub const Uniforms = extern struct {
     /// allowed to draw into, since it is real surface, not padding. It is
     /// what lets the grid sit a few pixels lower so a resize moves the
     /// content continuously instead of a row at a time. Zero at rest.
-    /// `.w` is unused.
+    /// `.w` is how many grid rows sit below the terminal viewport, revealed
+    /// by a grid shifted up (`smooth-scroll-rows` scrolling back reveals
+    /// more than one); with `.y`, the rows that are not the viewport's.
     scroll_offset: [4]f32 align(16),
 
     /// Bit mask defining which directions to

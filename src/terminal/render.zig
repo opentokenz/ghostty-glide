@@ -963,6 +963,9 @@ pub const RenderState = struct {
         /// them drew the grid a whole cell off — the renderer already had
         /// the new height while the terminal still had the old rows, or
         /// the reverse — which every divider drag showed as a flash.
+        /// Zero measures no leftover, which keeps it padding while a
+        /// shift still has the cell height to count rows with
+        /// (`smooth-scroll-rows`).
         terminal_height: u32 = 0,
 
         pub const none: Geometry = .{};
@@ -1560,7 +1563,7 @@ pub const RenderState = struct {
     /// rows fall. See `resolveShift`.
     pub const Shift = struct {
         /// The rows revealed beyond the viewport, captured as overscan:
-        /// rows above while the grid is drawn shifted down, the one below
+        /// rows above while the grid is drawn shifted down, rows below
         /// while it is drawn shifted up. Every row counted exists.
         overscan: Overscan = .{},
         /// How far below its row-aligned position the viewport's first row
@@ -1671,11 +1674,27 @@ pub const RenderState = struct {
                 );
             }
         } else if (pixel_offset < 0) {
-            const below = if (s.pages.getBottomRight(.viewport)) |br|
-                br.down(1)
-            else
-                null;
-            if (below != null) rows_below = 1 else pixel_offset = 0;
+            // A gesture's remainder reveals one row below; a
+            // `smooth-scroll-rows` move scrolling back can be drawn
+            // several rows up while it eases in, revealing as many.
+            const cell_height: f64 = @floatFromInt(geometry.cell_height);
+            const wanted: usize = if (geometry.cell_height > 0) @intFromFloat(@min(
+                @ceil(-pixel_offset / cell_height),
+                @as(f64, @floatFromInt(s.pages.rows)),
+            )) else 1;
+            var bottom_pin = s.pages.getBottomRight(.viewport);
+            while (rows_below < wanted) {
+                bottom_pin = (bottom_pin orelse break).down(1) orelse break;
+                rows_below += 1;
+            }
+            if (rows_below == 0) {
+                pixel_offset = 0;
+            } else if (geometry.cell_height > 0) {
+                pixel_offset = @max(
+                    pixel_offset,
+                    -@as(f64, @floatFromInt(rows_below)) * cell_height,
+                );
+            }
         }
 
         return .{
@@ -6694,6 +6713,93 @@ test "RenderState resolveShift is the shift an update draws" {
     s.nextSlice("\x1b[?1049h");
     t.screens.active.viewport_pixel_offset = 4;
     try expectShift(&state, &t, geometry, 0);
+}
+
+test "RenderState resolveShift reveals the rows below a row move scrolling back" {
+    // Under `smooth-scroll-rows` a move back through history is drawn
+    // where it was, rows above its place, while it eases in: the grid is
+    // shifted up by more than a row and every row it uncovers below the
+    // viewport has to be there.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // Three 10px rows in exactly 30px: no leftover to add.
+    const geometry: RenderState.Geometry = .{ .cell_height = 10, .terminal_height = 30 };
+
+    // At the top of history, 2.5 rows up reveals three rows below.
+    t.scrollViewport(.top);
+    t.screens.active.viewport_pixel_offset = -25;
+    const shift = RenderState.resolveShift(t.screens.active, geometry);
+    try testing.expectEqual(-25, shift.pixel_offset);
+    try testing.expect(shift.overscan.eql(.{ .below = 3 }));
+    try testShiftedUpdate(&state, &t, geometry);
+    try testing.expect(state.overscan.eql(.{ .below = 3 }));
+    try testing.expectEqual(6, testCapturedRows(&state));
+    {
+        const cells = state.row_data.slice().items(.cells);
+        try testing.expectEqual('1', cells[0].get(0).raw.codepoint());
+        try testing.expectEqual('4', cells[3].get(0).raw.codepoint());
+        try testing.expectEqual('6', cells[5].get(0).raw.codepoint());
+    }
+
+    // One row above the bottom only one row lies below: the shift is
+    // capped at it, as it is above when scrollback runs out.
+    t.scrollViewport(.bottom);
+    t.scrollViewport(.{ .delta = -1 });
+    t.screens.active.viewport_pixel_offset = -25;
+    const capped = RenderState.resolveShift(t.screens.active, geometry);
+    try testing.expectEqual(-10, capped.pixel_offset);
+    try testing.expect(capped.overscan.eql(.{ .below = 1 }));
+}
+
+test "RenderState resolveShift without a terminal height rests on whole rows" {
+    // `smooth-scroll-rows` hands over the cell height but no terminal
+    // height: the leftover stays padding, so a viewport with scrollback
+    // above is drawn where its rows fall, as without smooth scrolling,
+    // and only a row move's own offset shifts it.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6");
+
+    const rows_geometry: RenderState.Geometry = .{ .cell_height = 10 };
+    const at_rest = RenderState.resolveShift(t.screens.active, rows_geometry);
+    try testing.expectEqual(0, at_rest.pixel_offset);
+    try testing.expectEqual(0, at_rest.pixel_pad);
+    try testing.expect(at_rest.overscan.eql(.{}));
+
+    // The same screen with a 6px leftover measured sits on it.
+    const pixels: RenderState.Geometry = .{ .cell_height = 10, .terminal_height = 36 };
+    try testing.expectEqual(6, RenderState.resolveShift(t.screens.active, pixels).pixel_offset);
+
+    // A move forward easing in still reveals the rows above it.
+    t.screens.active.viewport_pixel_offset = 15;
+    const moving = RenderState.resolveShift(t.screens.active, rows_geometry);
+    try testing.expectEqual(15, moving.pixel_offset);
+    try testing.expect(moving.overscan.eql(.{ .above = 2 }));
 }
 
 test "RenderState Shift rowsAboveAt resolves the revealed rows" {

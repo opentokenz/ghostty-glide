@@ -326,6 +326,7 @@ const DerivedConfig = struct {
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     smooth_scroll: bool,
+    smooth_scroll_rows: bool,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
@@ -408,6 +409,7 @@ const DerivedConfig = struct {
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .smooth_scroll = config.@"smooth-scroll",
+            .smooth_scroll_rows = config.@"smooth-scroll-rows",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
@@ -3762,27 +3764,85 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
-            // Modify our viewport, this requires a lock since it affects
-            // rendering. We have to switch signs here because our delta
-            // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
-        }
+        const screen = self.io.terminal.screens.active;
 
-        // Smooth scrolling: publish the sub-row remainder of a precision
-        // gesture so the renderer can draw the viewport between rows.
-        // scrollViewport above reset the previous remainder; a discrete
-        // wheel never has one, and with the key off the remainder stays
-        // an accumulator detail. Sign matches yoff: positive is content
-        // moving down. The renderer validates it against the screen.
-        self.io.terminal.screens.active.viewport_pixel_offset =
-            if (self.config.smooth_scroll and scroll_mods.precision)
-                self.mouse.pending_scroll_y
-            else
-                0;
+        // Smooth scrolling by rows (`smooth-scroll-rows`): the sub-row
+        // remainder stays an accumulator detail, as without smooth
+        // scrolling, and each row the viewport actually moves is drawn
+        // from where it was. The offset carries that distance and the
+        // renderer eases it home (`decayViewportScroll`); a move while
+        // one is easing adds to what is drawn, so a gesture reads as one
+        // continuous motion. Rows the viewport could not move (the top or
+        // bottom of scrollback) move nothing.
+        if (self.config.smooth_scroll and self.config.smooth_scroll_rows) {
+            if (y.delta != 0) {
+                const drawn = screen.viewport_pixel_offset;
+                const before = screen.pages.scrollbar().offset;
+                self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+                const after = screen.pages.scrollbar().offset;
+                screen.viewport_pixel_offset = rowScrollOffset(
+                    drawn,
+                    before,
+                    after,
+                    @floatFromInt(self.size.cell.height),
+                    screen.pages.rows,
+                );
+            }
+        } else {
+            if (y.delta != 0) {
+                // Modify our viewport, this requires a lock since it affects
+                // rendering. We have to switch signs here because our delta
+                // is negative down but our viewport is positive down.
+                self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            }
+
+            // Smooth scrolling: publish the sub-row remainder of a precision
+            // gesture so the renderer can draw the viewport between rows.
+            // scrollViewport above reset the previous remainder; a discrete
+            // wheel never has one, and with the key off the remainder stays
+            // an accumulator detail. Sign matches yoff: positive is content
+            // moving down. The renderer validates it against the screen.
+            screen.viewport_pixel_offset =
+                if (self.config.smooth_scroll and scroll_mods.precision)
+                    self.mouse.pending_scroll_y
+                else
+                    0;
+        }
     }
 
     try self.queueRender();
+}
+
+/// The viewport offset that keeps what is drawn in place across a row-level
+/// move under `smooth-scroll-rows`: the viewport went from scrollbar row
+/// `before` to `after`, so the content is drawn that many rows from where
+/// it now belongs, plus whatever was still easing in (`drawn`). Positive is
+/// content drawn below its place, as for `Screen.viewport_pixel_offset`.
+/// Capped at a screen's height either way: past that none of what was on
+/// screen is left to keep in place.
+fn rowScrollOffset(
+    drawn: f64,
+    before: usize,
+    after: usize,
+    cell_height: f64,
+    rows: usize,
+) f64 {
+    const moved: f64 = @as(f64, @floatFromInt(after)) - @as(f64, @floatFromInt(before));
+    const limit: f64 = @as(f64, @floatFromInt(rows)) * cell_height;
+    return std.math.clamp(drawn + moved * cell_height, -limit, limit);
+}
+
+test "rowScrollOffset keeps the drawn content in place" {
+    const testing = std.testing;
+    // Scrolling back two rows: the content is drawn two rows up, and slides
+    // down into place.
+    try testing.expectEqual(-20, rowScrollOffset(0, 50, 48, 10, 24));
+    // Forward one row while 4px of an earlier move is still easing in.
+    try testing.expectEqual(14, rowScrollOffset(4, 48, 49, 10, 24));
+    // Clamped at the bottom of scrollback: nothing moved, nothing to ease.
+    try testing.expectEqual(0, rowScrollOffset(0, 76, 76, 10, 24));
+    // A jump past a screen keeps no more than a screen to slide through.
+    try testing.expectEqual(-240, rowScrollOffset(-50, 500, 100, 10, 24));
 }
 
 /// This is called when the content scale of the surface changes. The surface
@@ -4924,7 +4984,11 @@ fn viewportPixelShift(self: *const Surface) f64 {
 fn viewportShift(self: *const Surface) terminal.RenderState.Shift {
     const geometry: terminal.RenderState.Geometry = if (self.config.smooth_scroll) .{
         .cell_height = self.size.cell.height,
-        .terminal_height = self.size.terminal().height,
+        // By rows the leftover stays padding; see `viewportGeometry`.
+        .terminal_height = if (self.config.smooth_scroll_rows)
+            0
+        else
+            self.size.terminal().height,
     } else .none;
     return terminal.RenderState.resolveShift(
         self.io.terminal.screens.active,
