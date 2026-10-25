@@ -216,28 +216,48 @@ class SurfaceScrollView: NSView {
         }
     }
 
-    /// Sizes the document view and scrolls the content view according to the scrollbar state
-    private func synchronizeScrollView() {
-        // Update the document height to give our scroller the correct proportions
-        documentView.frame.size.height = documentHeight()
+    /// Whether an AppKit scroll is actually needed. The clip view rounds its
+    /// position to the backing pixel grid, so sending the same fractional
+    /// target repeatedly can produce a visible last-frame scrollbar wobble.
+    nonisolated static func needsScrollAdjustment(
+        currentY: CGFloat,
+        targetY: CGFloat,
+        backingScale: CGFloat
+    ) -> Bool {
+        abs(targetY - currentY) * max(1, backingScale) >= 1
+    }
 
-        // Only update our actual scroll position if we're not actively scrolling.
+    /// Sizes the document view and scrolls the content view according to the scrollbar state.
+    private func synchronizeScrollView() {
+        // Avoid resizing the document to an identical height on every update:
+        // that unnecessarily asks NSScrollView to recalculate its scrollbar.
+        let height = documentHeight()
+        if documentView.frame.size.height != height {
+            documentView.frame.size.height = height
+        }
+
+        // The terminal is authoritative except while the user drags the scroller.
         if !isLiveScrolling {
-            // Convert row units to pixels using cell height, ignore zero height.
             let cellHeight = surfaceView.cellSize.height
             if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
-                // Invert coordinate system: terminal offset is from top, AppKit position from bottom
-                let offsetY =
-                    CGFloat(scrollbar.total - scrollbar.offset - scrollbar.len) * cellHeight
-                scrollView.contentView.scroll(to: CGPoint(x: 0, y: offsetY))
+                // Terminal offset is from the top, AppKit's position from the bottom.
+                let rowsBelow = scrollbar.total - scrollbar.offset - scrollbar.len
+                let requestedY = CGFloat(rowsBelow) * cellHeight
+                let maxY = max(0, height - scrollView.contentSize.height)
+                let targetY = min(max(0, requestedY), maxY)
+                let clipView = scrollView.contentView
+                if Self.needsScrollAdjustment(
+                    currentY: clipView.bounds.origin.y,
+                    targetY: targetY,
+                    backingScale: window?.backingScaleFactor ?? 1
+                ) {
+                    clipView.scroll(to: CGPoint(x: 0, y: targetY))
+                }
 
-                // Track the current row position to avoid redundant movements when we
-                // move the scrollbar.
                 lastSentRow = Int(scrollbar.offset)
             }
         }
 
-        // Always update our scrolled view with the latest dimensions
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
