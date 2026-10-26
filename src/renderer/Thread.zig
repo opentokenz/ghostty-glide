@@ -648,6 +648,16 @@ fn animationTimerCallback(
             t.armAnimationTimer();
             return .disarm;
         },
+
+        // An idle cursor_blaze only needs one frame at each blink edge.
+        // Force this frame even when a DisplayLink transition is pending;
+        // never resume continuous VSync just to service this deadline.
+        .draw_once => {
+            t.renderer.requestShaderBlinkFrame();
+            t.drawFrame(true);
+            t.armAnimationTimer();
+            return .disarm;
+        },
     }
 }
 

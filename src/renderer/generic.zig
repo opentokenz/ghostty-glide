@@ -48,6 +48,56 @@ const DisplayLink = switch (builtin.target.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Known version of cursor_blaze.glsl with a 420ms trail and a 1.15Hz,
+/// 56%-duty blink. Other custom shaders retain Ghostty's continuous loop:
+/// their use of iTime cannot be inferred safely from their filename.
+const cursor_blaze_digest: [32]u8 = .{
+    0x6b, 0x45, 0x27, 0xe3, 0x65, 0xf8, 0xe9, 0x19,
+    0x89, 0x64, 0xc3, 0x0c, 0xa4, 0x62, 0x39, 0xc5,
+    0x42, 0x16, 0x2b, 0xd7, 0xd0, 0xbc, 0xbb, 0x4c,
+    0xb0, 0x85, 0xd4, 0x37, 0x19, 0x2a, 0x5a, 0xdb,
+};
+
+const CursorBlazeWake = struct {
+    delay_ms: u64,
+    continuous: bool,
+};
+
+/// Time-based deadlines, never a repeating idle timer. The current shader
+/// calculates blink from absolute iTime, so deadlines must share that clock.
+fn cursorBlazeWake(time_s: f64, cursor_age_s: f64) CursorBlazeWake {
+    const trail_s = 0.420;
+    const frame_ms: u64 = 8;
+    if (cursor_age_s < trail_s) {
+        const remaining: u64 = @max(1, @as(u64, @intFromFloat(
+            @ceil((trail_s - @max(cursor_age_s, 0)) * 1000),
+        )));
+        if (remaining > frame_ms) return .{ .delay_ms = frame_ms, .continuous = true };
+        // One final frame at the end of the trail prevents a frozen afterimage.
+        return .{ .delay_ms = remaining, .continuous = false };
+    }
+
+    const phase = @mod(time_s * 1.15, 1.0);
+    const distance = if (phase < 0.56) 0.56 - phase else 1.0 - phase;
+    return .{
+        .delay_ms = @max(1, @as(u64, @intFromFloat(@ceil(distance / 1.15 * 1000)))),
+        .continuous = false,
+    };
+}
+
+test "cursor blaze wake completes trail then uses absolute blink boundaries" {
+    const testing = std.testing;
+    try testing.expectEqual(CursorBlazeWake{ .delay_ms = 8, .continuous = true }, cursorBlazeWake(0.1, 0.1));
+    const trail_end = cursorBlazeWake(0.416, 0.416);
+    try testing.expect(!trail_end.continuous);
+    try testing.expect(trail_end.delay_ms >= 4 and trail_end.delay_ms <= 5);
+    try testing.expectEqual(CursorBlazeWake{ .delay_ms = 487, .continuous = false }, cursorBlazeWake(0, 0.42));
+    try testing.expectEqual(CursorBlazeWake{ .delay_ms = 348, .continuous = false }, cursorBlazeWake(0.60 / 1.15, 1));
+    const near_blink = cursorBlazeWake(0.445 / 1.15, 1);
+    try testing.expect(!near_blink.continuous);
+    try testing.expect(near_blink.delay_ms >= 100 and near_blink.delay_ms <= 101);
+}
+
 /// Where the frame on screen draws each animating region, for the surface
 /// to undo when it turns a pointer into a row: the offsets each frame in
 /// the swap chain was drawn with, and those of the frame presented last,
@@ -318,6 +368,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This is used when updating custom shader uniforms.
         last_frame_time: ?std.Io.Timestamp = null,
+
+        /// Only the recognized, unmodified cursor_blaze shader may idle.
+        /// Unknown/multiple shaders still animate exactly as upstream Ghostty.
+        cursor_blaze_idle: bool = false,
+        cursor_blaze_changed_at: ?std.Io.Timestamp = null,
+        cursor_blaze_frame_due: bool = false,
+        cursor_blaze_link_dirty: bool = false,
 
         /// The font structures.
         font_grid: *font.SharedGrid,
@@ -1002,6 +1059,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.* = undefined;
         }
 
+        /// Strictly identify the installed shader. A changed file, additional
+        /// shader, or read failure opts back into the original continuous mode.
+        fn supportsCursorBlazeIdle(self: *Self) bool {
+            if (self.config.custom_shaders.value.items.len != 1) return false;
+            const path = switch (self.config.custom_shaders.value.items[0]) {
+                inline else => |p| p,
+            };
+            if (!std.mem.eql(u8, std.fs.path.basename(path), "cursor_blaze.glsl")) return false;
+
+            const file = std.Io.Dir.cwd().openFile(global.io(), path, .{}) catch return false;
+            defer file.close(global.io());
+            const source = compat_file.readToEndAlloc(file, self.alloc, 8192) catch return false;
+            defer self.alloc.free(source);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+            return std.mem.eql(u8, &digest, &cursor_blaze_digest);
+        }
+
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1027,6 +1102,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.shaders = shaders;
             self.has_custom_shaders = has_custom_shaders;
+            self.cursor_blaze_idle = has_custom_shaders and self.supportsCursorBlazeIdle();
+            self.cursor_blaze_changed_at = null;
+            self.cursor_blaze_frame_due = false;
+            self.cursor_blaze_link_dirty = self.cursor_blaze_idle;
+            if (self.cursor_blaze_idle) {
+                log.info("cursor_blaze idle animation scheduling enabled", .{});
+            }
         }
 
         /// Callback called by renderer.Thread when it begins.
@@ -1309,6 +1391,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 /// than `update`.
                 draw,
 
+                /// A single shader blink edge, not a continuous draw.
+                draw_once,
+
                 /// Frame data must be updated first: updateFrame, then draw.
                 update,
             };
@@ -1325,13 +1410,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
-            const shader_delay: ?u64 = shader: {
+            const shader_wake: ?AnimationWake = shader: {
                 if (!self.has_custom_shaders) break :shader null;
-                break :shader switch (self.config.custom_shader_animation) {
-                    .false => null,
-                    .always => draw_interval_ms,
-                    .true => if (self.focused) draw_interval_ms else null,
-                };
+                const mode = self.config.custom_shader_animation;
+                if (mode == .false or (mode == .true and !self.focused)) break :shader null;
+
+                // Only a recognized cursor_blaze can stop continuous draws.
+                // Every other custom shader keeps Ghostty's original behavior.
+                if (mode == .true and self.cursor_blaze_idle) {
+                    const origin = self.first_frame_time orelse
+                        break :shader .{ .delay_ms = draw_interval_ms, .kind = .draw };
+                    const now: std.Io.Timestamp = .now(global.io(), .awake);
+                    const time_s: f64 = @as(f64, @floatFromInt(@max(
+                        origin.durationTo(now).nanoseconds,
+                        0,
+                    ))) / std.time.ns_per_s;
+                    const age_s: f64 = if (self.cursor_blaze_changed_at) |changed|
+                        @as(f64, @floatFromInt(@max(
+                            changed.durationTo(now).nanoseconds,
+                            0,
+                        ))) / std.time.ns_per_s
+                    else
+                        1.0;
+                    const next = cursorBlazeWake(time_s, age_s);
+                    break :shader .{
+                        .delay_ms = next.delay_ms,
+                        .kind = if (next.continuous) .draw else .draw_once,
+                    };
+                }
+                break :shader .{ .delay_ms = draw_interval_ms, .kind = .draw };
             };
 
             // Kitty animations tick during updateFrame; between
@@ -1354,10 +1461,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Region scroll animations decay every draw while any is
             // in flight; the shift is recomputed from the clock in
             // drawFrame, so a draw wake is all they need.
-            const draw_delay: ?u64 = if (self.region_anims.items.len > 0)
-                draw_interval_ms
+            const draw_wake: ?AnimationWake = if (self.region_anims.items.len > 0)
+                .{ .delay_ms = draw_interval_ms, .kind = .draw }
             else
-                shader_delay;
+                shader_wake;
 
             // A `smooth-scroll-rows` viewport move eases in the terminal's
             // own offset, which only updateFrame can reach (it holds the
@@ -1369,14 +1476,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // An update wake includes a draw, so it wins ties.
             if (update_delay) |k| {
-                if (draw_delay == null or k <= draw_delay.?) {
+                if (draw_wake == null or k <= draw_wake.?.delay_ms) {
                     return .{ .delay_ms = k, .kind = .update };
                 }
             }
 
-            if (draw_delay) |s| return .{ .delay_ms = s, .kind = .draw };
+            if (draw_wake) |wake| return wake;
 
             return null;
+        }
+
+        /// A distant blink deadline must not keep CVDisplayLink active.
+        fn hasContinuousAnimation(self: *const Self) bool {
+            const wake = self.animationWake() orelse return false;
+            return wake.kind != .draw_once and wake.delay_ms <= draw_interval_ms;
+        }
+
+        /// Mark a one-shot shader blink frame, independently of cell updates.
+        pub fn requestShaderBlinkFrame(self: *Self) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.cursor_blaze_frame_due = true;
         }
 
         /// Drop every region scroll animation and its ghost rows.
@@ -1833,7 +1953,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Only vsync if we have cell or image changes or animation
                 (self.cells_rebuilt or
                     self.images_rebuilt or
-                    self.animationWake() != null);
+                    self.hasContinuousAnimation());
 
             display_link.setRunning(should_run);
         }
@@ -2287,11 +2407,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The body of `drawFrame`. Must be called with `draw_mutex` held.
         ///
-        /// Returns true if the display link should be resynced once the
-        /// draw mutex is released. This is only ever true on the no-redraw
-        /// path, which a sync draw never takes. Sync draws come from the
-        /// main thread, so this keeps `syncDisplayLink` on the render
-        /// thread as its contract requires.
+        /// Returns true if the display link must be resynced outside the
+        /// draw mutex: when idle, or when a just-detected cursor movement
+        /// starts a new 420ms animation. Synchronous main-thread draws do
+        /// not resync the display link.
         fn drawFrameLocked(
             self: *Self,
             sync: bool,
@@ -2351,7 +2470,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.images_rebuilt or
-                self.animationWake() != null or
+                self.hasContinuousAnimation() or
+                self.cursor_blaze_frame_due or
                 sync;
 
             if (!needs_redraw) {
@@ -2362,6 +2482,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.cells_rebuilt = false;
             self.images_rebuilt = false;
+            self.cursor_blaze_frame_due = false;
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2626,7 +2747,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            return false;
+            // Cursor movement is detected when the shader uniforms for this
+            // frame are prepared; restarting VSync here prevents free-running
+            // 8ms timer draws while the display link was asleep.
+            const resync = self.cursor_blaze_link_dirty and !sync;
+            if (resync) self.cursor_blaze_link_dirty = false;
+            return resync;
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -3128,6 +3254,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     uniforms.current_cursor = new_cursor;
                     uniforms.current_cursor_color = cursor_color;
                     uniforms.cursor_change_time = uniforms.time;
+                    if (self.cursor_blaze_idle) {
+                        self.cursor_blaze_changed_at = now;
+                        // The update began before this cursor movement was
+                        // known. Restart VSync after the first rendered frame.
+                        self.cursor_blaze_link_dirty = true;
+                    }
                 }
             }
 
