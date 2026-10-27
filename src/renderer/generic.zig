@@ -3344,26 +3344,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         /// The pixel geometry the render state needs to measure the height
-        /// the viewport's rows don't account for, so the grid can sit on it
-        /// instead of leaving it as a strip of padding (see
-        /// `terminal.RenderState.Geometry`).
+        /// the viewport's rows don't account for, so the grid can sit on the
+        /// whole rows of it instead of leaving them as a strip of padding
+        /// (see `terminal.RenderState.Geometry`).
         ///
-        /// A grid only comes in whole rows, so that leftover grows as the
-        /// surface is resized until it is a full row and the viewport takes
-        /// one — and everything on screen jumps a cell at that instant.
-        /// Under `smooth-scroll` the grid is drawn that much lower instead,
-        /// with the row above partly revealed, so the same sequence of
-        /// sizes moves the content continuously.
+        /// A grid only comes in whole rows, so while the surface is resized
+        /// the leftover grows until it is a full row and the viewport takes
+        /// one — and everything on screen would jump a cell at that instant.
+        /// Mid-resize the terminal still has the old row count while the
+        /// renderer has the new height, and under `smooth-scroll` the grid
+        /// is drawn those whole rows lower instead, with the rows above
+        /// revealed, so the content keeps its place until the rows catch up.
+        /// The remainder below a row is rounding and stays padding, as it
+        /// does without smooth scrolling: a grid sat on it would rest
+        /// between rows for good, revealing the bottom of the row above at
+        /// the top of the screen — after a screen clear, the last scrollback
+        /// line, which reads as an extra row above the prompt.
         ///
         /// Only the pixels are handed over; the render state measures them
         /// against the terminal's rows, not this renderer's grid — the two
         /// are resized on different threads, and a frame caught between
         /// them drew the grid a whole cell off.
         ///
-        /// Under `smooth-scroll-rows` the leftover stays padding, as it does
-        /// without smooth scrolling and on the alternate screen, so the
-        /// viewport only ever comes to rest on whole rows: no terminal
-        /// height is handed over, and only a row move's offset shifts the
+        /// Under `smooth-scroll-rows` no terminal height is handed over: the
+        /// leftover stays padding, and only a row move's offset shifts the
         /// grid. A resize then steps a row at a time, as it does in `less`.
         fn viewportGeometry(self: *const Self) terminal.RenderState.Geometry {
             if (!self.config.smooth_scroll) return .none;

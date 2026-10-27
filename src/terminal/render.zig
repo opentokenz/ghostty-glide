@@ -363,15 +363,15 @@ pub const RenderState = struct {
     /// offset can't be honored (no such row).
     ///
     /// Two things add up here (see `Geometry`): the remainder of a scroll
-    /// gesture (`Screen.viewport_pixel_offset`) and the sub-row remainder
-    /// of the viewport's own height, which is what lets a resize move the
-    /// grid continuously instead of a row at a time. Their sum can exceed a
-    /// cell, which is why more than one row can be revealed above.
+    /// gesture (`Screen.viewport_pixel_offset`) and the whole rows of the
+    /// viewport's own height that a resize hasn't taken yet. Their sum can
+    /// exceed a cell, which is why more than one row can be revealed above.
     viewport_pixel_offset: f64 = 0,
 
-    /// The leftover height the grid was laid on this update (see
-    /// `Geometry`), for the renderer to draw as grid rather than padding
-    /// while the offset is non-zero. Zero without geometry.
+    /// The whole rows of leftover height the grid was laid on this update
+    /// (see `Geometry`), for the renderer to draw as grid rather than
+    /// padding while the offset is non-zero. Zero without geometry, and
+    /// zero for the remainder below a row, which stays padding.
     viewport_pixel_pad: f64 = 0,
 
     /// The cached selection so we can avoid expensive selection calculations
@@ -945,15 +945,17 @@ pub const RenderState = struct {
     /// not: pixels.
     ///
     /// The leftover is the height left over once the viewport's rows have
-    /// been laid out — `terminal_height - rows * cell_height`, under a cell
-    /// once the resize has settled. A grid only comes in whole rows, so as a surface is
-    /// resized that leftover grows until it is a full row and the viewport
-    /// takes one; everything on screen then jumps a cell at once. Drawing
-    /// the grid that leftover lower, with the row above partly revealed,
-    /// makes the same sequence continuous: the content slides down as the
-    /// leftover grows, and the row it gains arrives exactly where the
-    /// revealed sliver had got to. The renderer passes zero when smooth
-    /// scrolling is off, which is the behavior every renderer had before.
+    /// been laid out — `terminal_height - rows * cell_height`. Whole rows
+    /// of it are a resize the terminal hasn't taken yet: mid-drag the
+    /// terminal still has the old row count while the renderer has the new
+    /// height, and drawing the grid those rows lower keeps the content
+    /// where it was until the rows catch up. The remainder below a row is
+    /// just rounding and stays padding, so a surface at rest draws its
+    /// viewport where its rows fall; sitting it on that remainder would
+    /// leave the viewport between rows for good, the bottom of the row
+    /// above revealed at the top of the screen with nothing in flight to
+    /// account for it. The renderer passes zero when smooth scrolling is
+    /// off, which is the behavior every renderer had before.
     pub const Geometry = struct {
         cell_height: u32 = 0,
         /// The height of the terminal area (the screen less padding) in
@@ -1635,16 +1637,25 @@ pub const RenderState = struct {
             break :gesture raw;
         };
         // The viewport's leftover height, from the terminal's row count
-        // (see `Geometry`). Mid-resize it can reach a cell or more — the
-        // terminal still has the old rows while the renderer has the new
-        // height — and the sum then reveals a second row, which is what
-        // keeps the content where it was until the rows catch up. More
-        // rows than fit is no leftover at all.
+        // (see `Geometry`), counted in whole rows only. A sub-row
+        // remainder is the rounding of a cell-aligned surface, not
+        // content: sitting the grid on it leaves the viewport between
+        // rows for good, revealing the bottom of the row above it at the
+        // top of the screen with no gesture or resize in flight — after a
+        // screen clear, the last scrollback line, which reads as an extra
+        // row pushing the viewport down. Mid-resize the
+        // leftover reaches a row or more — the terminal still has the old
+        // rows while the renderer has the new height — and shifting by
+        // those rows is what keeps the content where it was until the
+        // rows catch up. More rows than fit is no leftover at all.
         const pixel_pad: f64 = pad: {
             if (geometry.cell_height == 0) break :pad 0;
             const laid_out = @as(u64, s.pages.rows) * geometry.cell_height;
             if (geometry.terminal_height <= laid_out) break :pad 0;
-            break :pad @floatFromInt(geometry.terminal_height - laid_out);
+            const extra = geometry.terminal_height - laid_out;
+            break :pad @floatFromInt(
+                extra / geometry.cell_height * geometry.cell_height,
+            );
         };
         var pixel_offset: f64 = gesture + pixel_pad;
         if (pixel_offset > 0) {
@@ -6526,6 +6537,53 @@ test "RenderState smooth scroll offset adds the revealed row" {
     }
 }
 
+test "RenderState sub-row leftover stays padding" {
+    // The leftover of a cell-aligned surface is rounding, not content:
+    // sitting the grid on it would leave the viewport between rows for
+    // good, the bottom of the row above revealed at the top of the screen
+    // with no gesture or resize in flight. After a screen clear that row
+    // is the last scrollback line, which reads as an extra row at the top
+    // of the screen (the viewport a row lower than the prompt it holds).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("1\r\n2\r\n3\r\n4\r\n5");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // Three 10px rows in 36px: 6px of rounding, no row of it.
+    try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
+    try testing.expectEqual(0, state.viewport_pixel_offset);
+    try testing.expectEqual(0, state.viewport_pixel_pad);
+    try testing.expect(state.overscan.eql(.{}));
+    try testing.expectEqual(3, testCapturedRows(&state));
+
+    // The viewport's own rows still start at the top of the terminal
+    // area, as they do without smooth scrolling at all.
+    {
+        const cells = state.row_data.slice().items(.cells);
+        try testing.expectEqual('3', cells[0].get(0).raw.codepoint());
+    }
+
+    // A whole row of leftover is a resize the terminal hasn't taken yet,
+    // and still keeps the content where it was.
+    try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 45 });
+    try testing.expectEqual(10, state.viewport_pixel_offset);
+    try testing.expectEqual(10, state.viewport_pixel_pad);
+    try testing.expectEqual(1, state.overscan.above);
+    try testing.expectEqual(4, testCapturedRows(&state));
+}
+
 test "RenderState geometry pad sits the grid on the leftover height" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6544,9 +6602,29 @@ test "RenderState geometry pad sits the grid on the leftover height" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
 
-    // A viewport 6px taller than its three rows: the grid is drawn that
-    // much lower and the row above is revealed by the same amount, so the
-    // next pixel of height moves the content rather than the row count.
+    // A viewport 6px taller than its three rows: less than a row of
+    // leftover is rounding, so it stays padding and the grid is drawn
+    // where its rows fall.
+    try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
+    try testing.expectEqual(0, state.viewport_pixel_offset);
+    try testing.expectEqual(0, state.overscan.above);
+    try testing.expectEqual(3, testCapturedRows(&state));
+
+    // A gesture pinned at the bottom of scrollback has nothing below to
+    // reveal, so its remainder is dropped on its own — for any remainder,
+    // since the remainder cycles through a cell as the gesture keeps
+    // failing to commit a row.
+    for ([_]f64{ -4, -8 }) |remainder| {
+        t.screens.active.viewport_pixel_offset = remainder;
+        try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
+        try testing.expectEqual(0, state.viewport_pixel_offset);
+        try testing.expectEqual(0, state.overscan.above);
+        try testing.expectEqual(3, testCapturedRows(&state));
+    }
+
+    // A gesture's own remainder still reveals the row above it; the
+    // rounding of the leftover no longer adds to it.
+    t.screens.active.viewport_pixel_offset = 6;
     try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
     try testing.expectEqual(6, state.viewport_pixel_offset);
     try testing.expectEqual(1, state.overscan.above);
@@ -6554,30 +6632,6 @@ test "RenderState geometry pad sits the grid on the leftover height" {
     {
         const cells = state.row_data.slice().items(.cells);
         try testing.expectEqual('2', cells[0].get(0).raw.codepoint());
-    }
-
-    // A gesture pinned at the bottom of scrollback has nothing below to
-    // reveal, so its remainder is dropped on its own and the grid stays
-    // sat on the leftover — for any remainder, since the remainder cycles
-    // through a cell as the gesture keeps failing to commit a row.
-    for ([_]f64{ -4, -8 }) |remainder| {
-        t.screens.active.viewport_pixel_offset = remainder;
-        try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
-        try testing.expectEqual(6, state.viewport_pixel_offset);
-        try testing.expectEqual(1, state.overscan.above);
-        try testing.expectEqual(4, testCapturedRows(&state));
-    }
-
-    // It adds to a gesture's own remainder, and a sum over a cell reveals
-    // a second row rather than tearing a strip nothing fills.
-    t.screens.active.viewport_pixel_offset = 6;
-    try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 36 });
-    try testing.expectEqual(12, state.viewport_pixel_offset);
-    try testing.expectEqual(2, state.overscan.above);
-    try testing.expectEqual(5, testCapturedRows(&state));
-    {
-        const cells = state.row_data.slice().items(.cells);
-        try testing.expectEqual('1', cells[0].get(0).raw.codepoint());
     }
 
     // Only as far as the scrollback goes: at the top the offset is capped
@@ -6591,32 +6645,33 @@ test "RenderState geometry pad sits the grid on the leftover height" {
 
     // The leftover follows the terminal's rows, not the renderer's grid,
     // so the grid stays put whichever side of a resize a frame lands on.
-    // Three rows in 45px leave 15 — over a cell — so two rows above are
-    // revealed and row "3" sits at 0 × 10 + 15 = 15px...
+    // Three rows in 45px leave 15 — one whole row of it — so one row above
+    // is revealed and row "3" sits at 1 × 10 = 10px, where it would be if
+    // the terminal had already taken the fourth row.
     t.scrollViewport(.bottom);
     try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 45 });
-    try testing.expectEqual(15, state.viewport_pixel_offset);
-    try testing.expectEqual(15, state.viewport_pixel_pad);
-    try testing.expectEqual(2, state.overscan.above);
-    try testing.expectEqual(5, testCapturedRows(&state));
+    try testing.expectEqual(10, state.viewport_pixel_offset);
+    try testing.expectEqual(10, state.viewport_pixel_pad);
+    try testing.expectEqual(1, state.overscan.above);
+    try testing.expectEqual(4, testCapturedRows(&state));
     {
         const cells = state.row_data.slice().items(.cells);
-        try testing.expectEqual('1', cells[0].get(0).raw.codepoint());
-        try testing.expectEqual('3', cells[2].get(0).raw.codepoint());
+        try testing.expectEqual('2', cells[0].get(0).raw.codepoint());
+        try testing.expectEqual('3', cells[1].get(0).raw.codepoint());
     }
 
-    // ...and once the terminal takes the fourth row, 5px are left, one
-    // row above is revealed, and row "3" is still at 1 × 10 + 5 = 15px.
+    // ...and once the terminal takes the fourth row, 5px are left — under
+    // a row, so padding — and the grid is drawn where its rows fall.
     try t.resize(alloc, .{ .cols = 10, .rows = 4 });
     try testShiftedUpdate(&state, &t, .{ .cell_height = 10, .terminal_height = 45 });
-    try testing.expectEqual(5, state.viewport_pixel_offset);
-    try testing.expectEqual(5, state.viewport_pixel_pad);
-    try testing.expectEqual(1, state.overscan.above);
-    try testing.expectEqual(5, testCapturedRows(&state));
+    try testing.expectEqual(0, state.viewport_pixel_offset);
+    try testing.expectEqual(0, state.viewport_pixel_pad);
+    try testing.expectEqual(0, state.overscan.above);
+    try testing.expectEqual(4, testCapturedRows(&state));
     {
         const cells = state.row_data.slice().items(.cells);
-        try testing.expectEqual('1', cells[0].get(0).raw.codepoint());
-        try testing.expectEqual('3', cells[2].get(0).raw.codepoint());
+        try testing.expectEqual('2', cells[0].get(0).raw.codepoint());
+        try testing.expectEqual('3', cells[1].get(0).raw.codepoint());
     }
 
     // The other order — the terminal has the rows before the renderer has
@@ -6656,7 +6711,8 @@ test "RenderState resolveShift is the shift an update draws" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
 
-    // Three 10px rows in 36px: a 6px leftover.
+    // Three 10px rows in 36px: 6px of leftover, less than a row of it, so
+    // the grid is drawn where its rows fall.
     const geometry: RenderState.Geometry = .{ .cell_height = 10, .terminal_height = 36 };
     const expectShift = struct {
         fn expectShift(
@@ -6682,22 +6738,23 @@ test "RenderState resolveShift is the shift an update draws" {
     s.nextSlice("1\r\n2");
     try expectShift(&state, &t, geometry, 0);
 
-    // Once there is scrollback the grid sits on the leftover...
+    // Scrollback above doesn't shift it: the leftover is rounding, not a
+    // gesture, so nothing is revealed for it.
     s.nextSlice("\r\n3\r\n4\r\n5");
-    try expectShift(&state, &t, geometry, 6);
+    try expectShift(&state, &t, geometry, 0);
 
     // ...and stays there when a gesture pinned at the bottom leaves a
     // remainder: nothing lies below to reveal, so the remainder is dropped.
     t.screens.active.viewport_pixel_offset = -4;
-    try expectShift(&state, &t, geometry, 6);
+    try expectShift(&state, &t, geometry, 0);
 
-    // Scrolled into history there are rows on both sides; both count.
+    // Scrolled into history there are rows on both sides, so the gesture's
+    // own remainder counts.
     t.scrollViewport(.{ .delta = -1 });
     t.screens.active.viewport_pixel_offset = -4;
-    try expectShift(&state, &t, geometry, 2);
+    try expectShift(&state, &t, geometry, -4);
 
-    // At the top of history nothing lies above: remainder and leftover
-    // both drop.
+    // At the top of history nothing lies above: the remainder drops.
     t.scrollViewport(.top);
     t.screens.active.viewport_pixel_offset = 4;
     try expectShift(&state, &t, geometry, 0);
@@ -6705,7 +6762,7 @@ test "RenderState resolveShift is the shift an update draws" {
     // One row of scrollback above, asked for more than a row: capped at
     // the row there is.
     t.scrollViewport(.{ .delta = 1 });
-    t.screens.active.viewport_pixel_offset = 8;
+    t.screens.active.viewport_pixel_offset = 12;
     try expectShift(&state, &t, geometry, 10);
 
     // The alternate screen has no scrollback at all.
@@ -6791,9 +6848,10 @@ test "RenderState resolveShift without a terminal height rests on whole rows" {
     try testing.expectEqual(0, at_rest.pixel_pad);
     try testing.expect(at_rest.overscan.eql(.{}));
 
-    // The same screen with a 6px leftover measured sits on it.
+    // The same screen with a 6px leftover measured still rests on its
+    // rows: less than a row is rounding, not content.
     const pixels: RenderState.Geometry = .{ .cell_height = 10, .terminal_height = 36 };
-    try testing.expectEqual(6, RenderState.resolveShift(t.screens.active, pixels).pixel_offset);
+    try testing.expectEqual(0, RenderState.resolveShift(t.screens.active, pixels).pixel_offset);
 
     // A move forward easing in still reveals the rows above it.
     t.screens.active.viewport_pixel_offset = 15;
