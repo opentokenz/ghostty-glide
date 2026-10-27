@@ -1809,6 +1809,11 @@ pub inline fn scroll(self: *Screen, behavior: Scroll) void {
 pub inline fn scrollClear(self: *Screen) !void {
     defer self.assertIntegrity();
 
+    // A row-level move invalidates any sub-row remainder, as `scroll`
+    // does: the viewport's rows moved, so a remainder left over from a
+    // gesture no longer describes what is drawn.
+    self.viewport_pixel_offset = 0;
+
     // Scrolling adds rows one at a time, and each new row can cause the
     // oldest scrollback page to be deleted to stay within the scrollback
     // limit. If the deleted page held the cursor, the page list moves the
