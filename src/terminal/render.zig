@@ -3962,6 +3962,10 @@ test "cursor state out of viewport" {
     try testing.expectEqual(0, state.cursor.active.x);
     try testing.expectEqual(1, state.cursor.active.y);
     try testing.expect(state.cursor.viewport == null);
+
+    // A cursor row outside the captured rows must not be drawn: the
+    // renderer keys the custom shader cursor off the same capture.
+    try testing.expect(state.cursor.captured == null);
 }
 
 test "dirty state" {

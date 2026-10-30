@@ -3133,9 +3133,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            // Cursor visibility
-            uniforms.cursor_visible = @intFromBool(self.terminal_state.cursor.visible);
-
             // Cursor style
             const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
             uniforms.previous_cursor_style = uniforms.current_cursor_style;
@@ -3183,7 +3180,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 0,
             };
 
-            if (self.cells.getCursorGlyph()) |cursor| {
+            // Custom shaders draw the cursor from these uniforms. A frame
+            // without a cursor glyph (scrolled out of the viewport, hidden,
+            // or blinking off) must hide it: the position uniforms keep the
+            // last one drawn, which would leave the cursor over unrelated
+            // rows instead of where the terminal no longer shows it.
+            const glyph = self.cells.getCursorGlyph();
+            uniforms.cursor_visible = @intFromBool(glyph != null);
+
+            if (glyph) |cursor| {
                 const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
                 const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
 
@@ -4493,6 +4498,56 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+test "custom shader cursor hides when the frame has no cursor glyph" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The frame path only reads the fields set below; `init` sets the
+    // rest in production.
+    var r: renderer.Renderer = undefined;
+    r.has_custom_shaders = true;
+    r.focused = true;
+    r.custom_shader_focused_changed = false;
+    r.first_frame_time = null;
+    r.last_frame_time = null;
+    r.cursor_blaze_idle = false;
+    r.cursor_blaze_link_dirty = false;
+    r.size = .{
+        .screen = .{ .width = 100, .height = 100 },
+        .cell = .{ .width = 10, .height = 10 },
+        .padding = .{},
+    };
+    r.uniforms = std.mem.zeroes(@TypeOf(r.uniforms));
+    r.custom_shader_uniforms = std.mem.zeroes(shadertoy.Uniforms);
+    r.terminal_state = .empty;
+    defer r.terminal_state.deinit(alloc);
+    // The terminal's cursor mode is still on; only the glyph is gone.
+    r.terminal_state.cursor.visible = true;
+
+    r.cells = .{};
+    defer r.cells.deinit(alloc);
+    try r.cells.resize(alloc, .{ .rows = 2, .columns = 2 });
+
+    // The cursor was visible on the previous frame: custom shaders keep
+    // the last value until a frame says otherwise.
+    r.custom_shader_uniforms.cursor_visible = 1;
+
+    const CellText = renderer.Renderer.API.shaders.CellText;
+    var glyph: CellText = std.mem.zeroes(CellText);
+    glyph.grid_pos = .{ 1, 1 };
+    glyph.glyph_size = .{ 1, 8 };
+    r.cells.setCursor(glyph, .bar);
+    try r.updateCustomShaderUniformsForFrame();
+    try testing.expectEqual(1, r.custom_shader_uniforms.cursor_visible);
+
+    // Scrolled out of the viewport: `rebuildCells` clears the cursor glyph.
+    // Custom shaders keep their last cursor uniforms, so the frame must
+    // tell them not to draw it where it no longer is.
+    r.cells.setCursor(null, null);
+    try r.updateCustomShaderUniformsForFrame();
+    try testing.expectEqual(0, r.custom_shader_uniforms.cursor_visible);
 }
 
 test "PresentedRegions answers with the offsets of the frame on screen" {
